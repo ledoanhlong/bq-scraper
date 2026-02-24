@@ -4,16 +4,19 @@
  * B&Q (diy.com) verified seller scraper — API-based.
  *
  * Calls the Kingfisher marketplace seller API directly (no browser needed).
- * Much faster and more reliable than browser-based scraping.
  *
  * Usage:
- *   node scrape.mjs
- *   node scrape.mjs --from 3900 --to 4100
- *   node scrape.mjs --from 3958 --to 3959 --delay 1500
+ *   node scrape.mjs                                   # IDs 1–25000, 5 concurrent
+ *   node scrape.mjs --from 3900 --to 4100             # custom range
+ *   node scrape.mjs --concurrency 10 --delay 300      # faster
+ *   node scrape.mjs --from 1 --to 25000 --delay 500   # full run, conservative
  *
  * Output:
- *   results/sellers.csv
- *   results/progress.json
+ *   results/sellers.csv      — one row per found seller
+ *   results/progress.json    — tracks completed IDs (safe to resume)
+ *
+ * The scraper is fully resumable: re-run the same command and it skips
+ * already-processed IDs. Ctrl+C is safe — progress is saved on exit.
  */
 
 import { writeFileSync, readFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
@@ -21,13 +24,14 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, appendFileSync } fr
 // --- Config ---
 const args = parseArgs(process.argv.slice(2));
 const FROM_ID = args.from ?? 1;
-const TO_ID = args.to ?? 10000;
-const DELAY_MS = args.delay ?? 2000;
+const TO_ID = args.to ?? 25000;
+const DELAY_MS = args.delay ?? 500;
+const CONCURRENCY = args.concurrency ?? 5;
 
 const RESULTS_DIR = 'results';
 const CSV_PATH = `${RESULTS_DIR}/sellers.csv`;
 const PROGRESS_PATH = `${RESULTS_DIR}/progress.json`;
-const MAX_RETRIES = 2;
+const MAX_RETRIES = 3;
 
 const CSV_COLUMNS = [
   'sellerId',
@@ -38,79 +42,105 @@ const CSV_COLUMNS = [
   'sourceUrl',
 ];
 
+// Kingfisher marketplace seller API key (publicly embedded in every diy.com page)
+const SELLER_API_KEY = 'eyJvcmciOiI2MGFlMTA0ZGVjM2M1ZjAwMDFkMjYxYTkiLCJpZCI6IjE0NmFhMTQ5ZGIxYjQ4OGI4OWJlMTNkNTI0MmVhMmZmIiwiaCI6Im11cm11cjEyOCJ9';
+
+let shuttingDown = false;
+
 async function main() {
   mkdirSync(RESULTS_DIR, { recursive: true });
 
   const progress = loadProgress();
   initCsv();
 
+  // Graceful shutdown — save progress on Ctrl+C
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log('\n\nShutting down gracefully — saving progress...');
+    saveProgress(progress);
+    console.log('Progress saved. Re-run the same command to resume.');
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
   const total = TO_ID - FROM_ID + 1;
   let processedThisRun = 0;
   let found = 0;
   let errors = 0;
 
-  console.log(`\nB&Q Verified Seller Scraper (API)`);
-  console.log(`Range: ${FROM_ID} – ${TO_ID} (${total} IDs)`);
-  console.log(`Delay: ${DELAY_MS}ms`);
-  console.log(`Output: ${CSV_PATH}`);
-
-  const alreadyDone = Object.keys(progress)
-    .map(Number)
-    .filter((id) => id >= FROM_ID && id <= TO_ID).length;
-
-  if (alreadyDone > 0) {
-    console.log(`Resuming — ${alreadyDone} IDs already processed`);
+  // Build list of IDs still to process
+  const pendingIds = [];
+  for (let id = FROM_ID; id <= TO_ID; id++) {
+    if (!progress[id]) pendingIds.push(id);
   }
 
+  const alreadyDone = total - pendingIds.length;
+
+  console.log(`\nB&Q Verified Seller Scraper (API)`);
+  console.log(`Range: ${FROM_ID} – ${TO_ID} (${total} IDs)`);
+  console.log(`Concurrency: ${CONCURRENCY} | Delay: ${DELAY_MS}ms between batches`);
+  console.log(`Output: ${CSV_PATH}`);
+  if (alreadyDone > 0) {
+    console.log(`Resuming — ${alreadyDone} already done, ${pendingIds.length} remaining`);
+  }
   console.log('');
 
   try {
-    for (let id = FROM_ID; id <= TO_ID; id++) {
-      if (progress[id]) continue;
+    // Process in batches of CONCURRENCY
+    for (let i = 0; i < pendingIds.length; i += CONCURRENCY) {
+      if (shuttingDown) break;
 
-      processedThisRun++;
-      const result = await scrapeSeller(id);
+      const batch = pendingIds.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(batch.map((id) => scrapeSeller(id)));
 
-      if (result.error) {
-        errors++;
-        progress[id] = { status: 'error', error: result.error };
-        logLine(id, `ERROR: ${result.error}`, total, processedThisRun + alreadyDone);
-      } else if (!result.businessName && !result.vatNumber && !result.registeredAddress && !result.shippedFrom) {
-        progress[id] = { status: 'empty' };
-        logLine(id, 'no seller found', total, processedThisRun + alreadyDone);
-      } else {
-        found++;
-        progress[id] = { status: 'ok' };
-        appendCsvRow(result);
-        logLine(id, `✓ ${result.businessName || '(seller found)'}`, total, processedThisRun + alreadyDone);
+      for (const result of results) {
+        if (shuttingDown) break;
+
+        processedThisRun++;
+        const done = processedThisRun + alreadyDone;
+
+        if (result.error) {
+          errors++;
+          progress[result.sellerId] = { status: 'error', error: result.error };
+          logLine(result.sellerId, `ERROR: ${result.error}`, total, done);
+        } else if (!result.businessName && !result.vatNumber && !result.registeredAddress && !result.shippedFrom) {
+          progress[result.sellerId] = { status: 'empty' };
+          logLine(result.sellerId, 'no seller found', total, done);
+        } else {
+          found++;
+          progress[result.sellerId] = { status: 'ok' };
+          appendCsvRow(result);
+          logLine(result.sellerId, `OK ${result.businessName || '(seller found)'}`, total, done);
+        }
       }
 
-      if (processedThisRun % 10 === 0) saveProgress(progress);
-      if (id < TO_ID) await sleep(DELAY_MS);
+      // Save progress every 50 IDs processed
+      if (processedThisRun % 50 < CONCURRENCY) saveProgress(progress);
+
+      // Delay between batches (not between individual requests within a batch)
+      if (i + CONCURRENCY < pendingIds.length && !shuttingDown) {
+        await sleep(DELAY_MS);
+      }
     }
   } finally {
     saveProgress(progress);
   }
 
   console.log(`\n--- Done ---`);
-  console.log(`Processed: ${processedThisRun + alreadyDone} / ${total}`);
+  console.log(`Processed this run: ${processedThisRun}`);
+  console.log(`Total processed: ${processedThisRun + alreadyDone} / ${total}`);
   console.log(`Sellers found: ${found}`);
   console.log(`Errors: ${errors}`);
   console.log(`Results saved to: ${CSV_PATH}`);
 }
 
-// Kingfisher marketplace seller API key (publicly embedded in every diy.com page)
-const SELLER_API_KEY = 'eyJvcmciOiI2MGFlMTA0ZGVjM2M1ZjAwMDFkMjYxYTkiLCJpZCI6IjE0NmFhMTQ5ZGIxYjQ4OGI4OWJlMTNkNTI0MmVhMmZmIiwiaCI6Im11cm11cjEyOCJ9';
-
 async function scrapeSeller(sellerId) {
-  const url = `https://www.diy.com/verified-sellers/seller/${sellerId}`;
+  const sourceUrl = `https://www.diy.com/verified-sellers/seller/${sellerId}`;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Call the Kingfisher marketplace seller API directly.
-      // URL: /v1/sellers/BQUK/{sellerId}  (BQUK = B&Q UK tenant)
-      // Auth: Authorization header (not x-api-key)
-      // Accept: */* (application/json returns 406)
       const apiUrl = `https://api.kingfisher.com/v1/sellers/BQUK/${sellerId}`;
       const resp = await fetch(apiUrl, {
         headers: {
@@ -119,8 +149,20 @@ async function scrapeSeller(sellerId) {
         },
       });
 
+      // Not found — seller ID doesn't exist
       if (resp.status === 404 || resp.status === 410) {
-        return emptyResult(sellerId, url);
+        return emptyResult(sellerId, sourceUrl);
+      }
+
+      // Rate limited — back off and retry
+      if (resp.status === 429) {
+        const retryAfter = parseInt(resp.headers.get('retry-after') || '0', 10);
+        const backoff = Math.max(retryAfter * 1000, 2000 * Math.pow(2, attempt));
+        if (attempt < MAX_RETRIES) {
+          await sleep(backoff);
+          continue;
+        }
+        return { sellerId, error: 'Rate limited (429)' };
       }
 
       if (!resp.ok) {
@@ -133,7 +175,7 @@ async function scrapeSeller(sellerId) {
       }
 
       const json = await resp.json();
-      return parseSellerApiResponse(json, sellerId, url);
+      return parseSellerApiResponse(json, sellerId, sourceUrl);
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         await sleep(4000 * attempt);
@@ -165,7 +207,6 @@ function parseSellerApiResponse(json, sellerId, sourceUrl) {
   const vatNumber = (attrs.taxIdentificationNumber || '').trim();
   const shippedFrom = (attrs.shippingCountry || '').trim();
 
-  // Use corporateContactInformation for the registered address
   let registeredAddress = '';
   const addr = attrs.corporateContactInformation || attrs.contactInformation;
   if (addr && typeof addr === 'object') {
@@ -250,6 +291,7 @@ function parseArgs(argv) {
     if (argv[i] === '--from' && argv[i + 1]) result.from = parseInt(argv[i + 1], 10);
     if (argv[i] === '--to' && argv[i + 1]) result.to = parseInt(argv[i + 1], 10);
     if (argv[i] === '--delay' && argv[i + 1]) result.delay = parseInt(argv[i + 1], 10);
+    if (argv[i] === '--concurrency' && argv[i + 1]) result.concurrency = parseInt(argv[i + 1], 10);
   }
   return result;
 }
