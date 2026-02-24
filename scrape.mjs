@@ -167,21 +167,32 @@ async function scrapeSeller(sellerId) {
         return emptyResult(sellerId, url);
       }
 
-      // Give the page a moment to render any content
-      // and try to wait for seller-specific text if present
+      // Wait for the React SPA to render seller content or a "not found" message.
+      // Both are valid outcomes — we just need the page to finish rendering.
       try {
         await page.waitForFunction(
           () => {
-            const t = document.body?.innerText || '';
-            return /VAT number|Registered address|This seller ships from|Shipped from/i.test(t);
+            const t = document.body?.innerText || ‘’;
+            // Seller data rendered
+            if (/VAT number|Registered address|This seller ships from|Shipped from/i.test(t)) return true;
+            // "Not found" rendered (React component)
+            if (document.querySelector(‘[data-test-id="seller-not-found"]’)) return true;
+            if (/seller details cannot be found|seller not found/i.test(t)) return true;
+            return false;
           },
           { timeout: 8000 }
         );
       } catch {
-        // continue anyway — we'll inspect HTML below
+        // continue anyway — we’ll inspect HTML below
       }
 
       const html = await page.content();
+
+      // Early detection: B&Q renders a specific element for missing sellers
+      if (html.includes(‘data-test-id="seller-not-found"’) ||
+          html.includes(‘seller details cannot be found’)) {
+        return emptyResult(sellerId, url);
+      }
 
       // Detect blocks/interstitials
       if (isBlockedHtml(html, status, finalUrl)) {
@@ -191,7 +202,7 @@ async function scrapeSeller(sellerId) {
           await sleep(4000 * attempt);
           continue;
         }
-        return { sellerId, error: `Blocked/challenge page (HTTP ${status ?? 'unknown'})` };
+        return { sellerId, error: `Blocked/challenge page (HTTP ${status ?? ‘unknown’})` };
       }
 
       // B&Q sometimes returns generic pages; parse and decide
@@ -204,10 +215,10 @@ async function scrapeSeller(sellerId) {
         // If content clearly says not found -> empty
         const text = html.toLowerCase();
         if (
-          text.includes('page not found') ||
-          text.includes('seller not found') ||
-          text.includes('sorry, we can’t find') ||
-          text.includes('sorry, we can&apos;t find')
+          text.includes(‘page not found’) ||
+          text.includes(‘seller not found’) ||
+          text.includes(‘sorry, we can’t find’) ||
+          text.includes(‘sorry, we can&apos;t find’)
         ) {
           return emptyResult(sellerId, url);
         }
@@ -244,9 +255,14 @@ function emptyResult(sellerId, url) {
 }
 
 function isBlockedHtml(html, status, finalUrl = '') {
-  const text = (html || '').toLowerCase();
+  // Strip <script> and <style> tags to avoid matching config JSON
+  // (diy.com embeds "showCaptcha", "googleCaptchaSiteKey" etc. in every page)
+  const visibleText = (html || '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .toLowerCase();
 
-  // Strong signals of WAF / bot challenge
+  // Strong signals of WAF / bot challenge (checked against visible content only)
   const blockSignals = [
     'access denied',
     'request unsuccessful',
@@ -255,22 +271,30 @@ function isBlockedHtml(html, status, finalUrl = '') {
     'pardon our interruption',
     'sorry, you have been blocked',
     'verify you are human',
-    'captcha',
     'cf-chl',
-    'cloudflare',
-    'akamai',
-    'perimeterx',
-    'datadome',
+    'bot detection',
+  ];
+
+  // These signals are safe to check against the full HTML
+  // (they won't appear in normal page config)
+  const fullHtmlSignals = [
     'incapsula',
     'distil',
     '/_sec/',
-    'bot detection',
   ];
 
   // status 503 often means challenge/interstitial here
   if (status === 503) return true;
 
-  if (blockSignals.some((s) => text.includes(s))) return true;
+  if (blockSignals.some((s) => visibleText.includes(s))) return true;
+
+  const fullText = (html || '').toLowerCase();
+  if (fullHtmlSignals.some((s) => fullText.includes(s))) return true;
+
+  // Check for actual captcha challenge elements (not config keys)
+  if (/solve.{0,20}captcha|complete.{0,20}captcha|captcha-container|captcha-box|g-recaptcha[^"]/i.test(visibleText)) {
+    return true;
+  }
 
   // Sometimes challenge pages redirect to generic routes
   if (finalUrl && /challenge|captcha|blocked/i.test(finalUrl)) return true;
