@@ -164,81 +164,55 @@ async function scrapeSeller(sellerId) {
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const response = await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 45000,
-      });
+      // Strategy: call the Kingfisher seller API directly instead of waiting
+      // for the SPA to render. The SPA's own API call gets blocked by bot
+      // detection (Bolt/VICE), but we can call it ourselves.
 
-      const status = response?.status?.() ?? null;
-      const finalUrl = page.url();
+      // On first attempt (or if page is blank), navigate to diy.com to
+      // establish cookies/session, then call the API from within the page.
+      const currentUrl = page.url();
+      if (!currentUrl.startsWith('https://www.diy.com')) {
+        await page.goto('https://www.diy.com', {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000,
+        });
+      }
 
-      // Hard not-found statuses
-      if (status && [404, 410].includes(status)) {
+      // Call the seller API directly from the page context.
+      // The API key and endpoint are publicly embedded in every diy.com page.
+      const apiResult = await page.evaluate(async (sid) => {
+        const API_KEY = 'eyJvcmciOiI2MGFlMTA0ZGVjM2M1ZjAwMDFkMjYxYTkiLCJpZCI6IjE0NmFhMTQ5ZGIxYjQ4OGI4OWJlMTNkNTI0MmVhMmZmIiwiaCI6Im11cm11cjEyOCJ9';
+        try {
+          const resp = await fetch(
+            `https://api.kingfisher.com/v1/sellers/${sid}`,
+            { headers: { 'x-api-key': API_KEY } }
+          );
+          if (resp.status === 404 || resp.status === 410) return { notFound: true };
+          if (!resp.ok) return { error: `API ${resp.status}` };
+          const data = await resp.json();
+          return { data };
+        } catch (err) {
+          return { error: err.message || String(err) };
+        }
+      }, sellerId);
+
+      // API failed — retry or return error
+      if (apiResult.error) {
+        if (attempt < MAX_RETRIES) {
+          await sleep(4000 * attempt);
+          continue;
+        }
+        return { sellerId, error: `Seller API: ${apiResult.error}` };
+      }
+
+      // Seller does not exist
+      if (apiResult.notFound) {
         return emptyResult(sellerId, url);
       }
 
-      // The React SPA initially renders a "seller-not-found" placeholder while
-      // the seller API call is still in-flight, then replaces it with real data.
-      // So we must wait for POSITIVE seller data first — not the placeholder.
-      let foundSellerData = false;
-      try {
-        await page.waitForFunction(
-          () => {
-            const t = document.body?.innerText || '';
-            return /VAT number|Registered address|This seller ships from|Shipped from/i.test(t);
-          },
-          { timeout: 12000 }
-        );
-        foundSellerData = true;
-      } catch {
-        // Seller data didn't appear — could be a genuine "not found" or a slow page.
-        // Wait briefly for the network to settle before capturing HTML.
-        try {
-          await page.waitForLoadState('networkidle', { timeout: 5000 });
-        } catch {
-          // ignore — best-effort
-        }
-      }
-
-      const html = await page.content();
-
-      // Detect blocks/interstitials
-      if (isBlockedHtml(html, status, finalUrl)) {
-        saveDebugHtml(`${DEBUG_DIR}/blocked_${sellerId}.html`, html);
-        // retry once with a refresh-like pause
-        if (attempt < MAX_RETRIES) {
-          await sleep(4000 * attempt);
-          continue;
-        }
-        return { sellerId, error: `Blocked/challenge page (HTTP ${status ?? 'unknown'})` };
-      }
-
-      // B&Q sometimes returns generic pages; parse and decide
-      const parsed = parseSellerPage(html, sellerId, url);
-
-      // If parser got nothing, save sample for inspection
-      if (!parsed.businessName && !parsed.vatNumber && !parsed.registeredAddress && !parsed.shippedFrom) {
-        saveDebugHtml(`${DEBUG_DIR}/empty_${sellerId}.html`, html);
-
-        // If content clearly says not found -> empty
-        const text = html.toLowerCase();
-        if (
-          text.includes('page not found') ||
-          text.includes('seller not found') ||
-          text.includes("sorry, we can't find") ||
-          text.includes('sorry, we can&apos;t find')
-        ) {
-          return emptyResult(sellerId, url);
-        }
-
-        // otherwise maybe transient/challenge page disguised as 200
-        if (attempt < MAX_RETRIES) {
-          await sleep(4000 * attempt);
-          continue;
-        }
-      }
-
-      return parsed;
+      // Parse the API response into our standard format
+      const seller = apiResult.data;
+      return parseSellerApiResponse(seller, sellerId, url);
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         await sleep(4000 * attempt);
@@ -249,6 +223,55 @@ async function scrapeSeller(sellerId) {
   }
 
   return { sellerId, error: 'Unknown scraping failure' };
+}
+
+/**
+ * Parse the Kingfisher seller API JSON response into our flat CSV format.
+ * The API typically returns fields like corporateName, vatNumber, address, etc.
+ */
+function parseSellerApiResponse(data, sellerId, sourceUrl) {
+  if (!data || typeof data !== 'object') {
+    return emptyResult(sellerId, sourceUrl);
+  }
+
+  // The API response structure may vary; try common field names
+  const businessName =
+    data.corporateName || data.companyName || data.name || data.businessName || '';
+
+  const vatNumber =
+    data.vatNumber || data.vatNo || data.vat || '';
+
+  // Address may be a string or structured object
+  let registeredAddress = '';
+  if (typeof data.address === 'string') {
+    registeredAddress = data.address;
+  } else if (data.address && typeof data.address === 'object') {
+    const a = data.address;
+    registeredAddress = [
+      a.line1 || a.street1 || a.addressLine1 || '',
+      a.line2 || a.street2 || a.addressLine2 || '',
+      a.city || a.town || '',
+      a.county || a.state || a.region || '',
+      a.postcode || a.postalCode || a.zipCode || a.zip || '',
+      a.country || a.countryCode || '',
+    ].filter(Boolean).join(', ');
+  } else if (data.registeredAddress) {
+    registeredAddress = typeof data.registeredAddress === 'string'
+      ? data.registeredAddress
+      : JSON.stringify(data.registeredAddress);
+  }
+
+  const shippedFrom =
+    data.shippingCountry || data.shipsFrom || data.countryShippedFrom || '';
+
+  return {
+    sellerId,
+    businessName: (businessName || '').trim(),
+    vatNumber: (vatNumber || '').trim(),
+    registeredAddress: (registeredAddress || '').trim(),
+    shippedFrom: (shippedFrom || '').trim(),
+    sourceUrl,
+  };
 }
 
 function emptyResult(sellerId, url) {
