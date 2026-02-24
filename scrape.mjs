@@ -167,32 +167,30 @@ async function scrapeSeller(sellerId) {
         return emptyResult(sellerId, url);
       }
 
-      // Wait for the React SPA to render seller content or a "not found" message.
-      // Both are valid outcomes — we just need the page to finish rendering.
+      // The React SPA initially renders a "seller-not-found" placeholder while
+      // the seller API call is still in-flight, then replaces it with real data.
+      // So we must wait for POSITIVE seller data first — not the placeholder.
+      let foundSellerData = false;
       try {
         await page.waitForFunction(
           () => {
             const t = document.body?.innerText || '';
-            // Seller data rendered
-            if (/VAT number|Registered address|This seller ships from|Shipped from/i.test(t)) return true;
-            // "Not found" rendered (React component)
-            if (document.querySelector('[data-test-id="seller-not-found"]')) return true;
-            if (/seller details cannot be found|seller not found/i.test(t)) return true;
-            return false;
+            return /VAT number|Registered address|This seller ships from|Shipped from/i.test(t);
           },
-          { timeout: 8000 }
+          { timeout: 12000 }
         );
+        foundSellerData = true;
       } catch {
-        // continue anyway — we'll inspect HTML below
+        // Seller data didn't appear — could be a genuine "not found" or a slow page.
+        // Wait briefly for the network to settle before capturing HTML.
+        try {
+          await page.waitForLoadState('networkidle', { timeout: 5000 });
+        } catch {
+          // ignore — best-effort
+        }
       }
 
       const html = await page.content();
-
-      // Early detection: B&Q renders a specific element for missing sellers
-      if (html.includes('data-test-id="seller-not-found"') ||
-          html.includes('seller details cannot be found')) {
-        return emptyResult(sellerId, url);
-      }
 
       // Detect blocks/interstitials
       if (isBlockedHtml(html, status, finalUrl)) {
