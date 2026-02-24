@@ -24,7 +24,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, appendFileSync } fr
 // --- Config ---
 const args = parseArgs(process.argv.slice(2));
 const FROM_ID = args.from ?? 1;
-const TO_ID = args.to ?? 25000;
+const TO_ID = args.to ?? 35000;
 const DELAY_MS = args.delay ?? 500;
 const CONCURRENCY = args.concurrency ?? 5;
 
