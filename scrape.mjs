@@ -135,6 +135,16 @@ async function initBrowser() {
     },
   });
 
+  // Pre-set TrustArc cookie consent so the SPA doesn't gate API calls
+  // behind the consent banner. Without these, the seller API never fires.
+  await context.addCookies([
+    { name: 'notice_gdpr_prefs', value: '0,1,2:', domain: '.diy.com', path: '/' },
+    { name: 'notice_preferences', value: '2:', domain: '.diy.com', path: '/' },
+    { name: 'notice_behavior', value: 'expressed,eu', domain: '.diy.com', path: '/' },
+    { name: 'cmapi_gtm_bl', value: '', domain: '.diy.com', path: '/' },
+    { name: 'cmapi_cookie_privacy', value: 'permit 1,2,3', domain: '.diy.com', path: '/' },
+  ]);
+
   page = await context.newPage();
 
   // Light stealth-ish tweaks (not magic, but helps)
