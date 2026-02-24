@@ -161,58 +161,48 @@ async function closeBrowser() {
 
 async function scrapeSeller(sellerId) {
   const url = `https://www.diy.com/verified-sellers/seller/${sellerId}`;
+  const SELLER_API_KEY = 'eyJvcmciOiI2MGFlMTA0ZGVjM2M1ZjAwMDFkMjYxYTkiLCJpZCI6IjE0NmFhMTQ5ZGIxYjQ4OGI4OWJlMTNkNTI0MmVhMmZmIiwiaCI6Im11cm11cjEyOCJ9';
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Strategy: call the Kingfisher seller API directly instead of waiting
-      // for the SPA to render. The SPA's own API call gets blocked by bot
-      // detection (Bolt/VICE), but we can call it ourselves.
+      // Call the Kingfisher seller API directly from Node.js.
+      // The API key is publicly embedded in every diy.com page.
+      // This bypasses both the broken SPA rendering and CORS restrictions.
+      const apiUrl = `https://api.kingfisher.com/v1/sellers/${sellerId}`;
+      const resp = await fetch(apiUrl, {
+        headers: {
+          'x-api-key': SELLER_API_KEY,
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Origin': 'https://www.diy.com',
+          'Referer': 'https://www.diy.com/',
+        },
+      });
 
-      // On first attempt (or if page is blank), navigate to diy.com to
-      // establish cookies/session, then call the API from within the page.
-      const currentUrl = page.url();
-      if (!currentUrl.startsWith('https://www.diy.com')) {
-        await page.goto('https://www.diy.com', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000,
-        });
+      if (resp.status === 404 || resp.status === 410) {
+        return emptyResult(sellerId, url);
       }
 
-      // Call the seller API directly from the page context.
-      // The API key and endpoint are publicly embedded in every diy.com page.
-      const apiResult = await page.evaluate(async (sid) => {
-        const API_KEY = 'eyJvcmciOiI2MGFlMTA0ZGVjM2M1ZjAwMDFkMjYxYTkiLCJpZCI6IjE0NmFhMTQ5ZGIxYjQ4OGI4OWJlMTNkNTI0MmVhMmZmIiwiaCI6Im11cm11cjEyOCJ9';
-        try {
-          const resp = await fetch(
-            `https://api.kingfisher.com/v1/sellers/${sid}`,
-            { headers: { 'x-api-key': API_KEY } }
-          );
-          if (resp.status === 404 || resp.status === 410) return { notFound: true };
-          if (!resp.ok) return { error: `API ${resp.status}` };
-          const data = await resp.json();
-          return { data };
-        } catch (err) {
-          return { error: err.message || String(err) };
-        }
-      }, sellerId);
-
-      // API failed — retry or return error
-      if (apiResult.error) {
+      if (!resp.ok) {
+        const errMsg = `API HTTP ${resp.status}`;
         if (attempt < MAX_RETRIES) {
           await sleep(4000 * attempt);
           continue;
         }
-        return { sellerId, error: `Seller API: ${apiResult.error}` };
+        return { sellerId, error: errMsg };
       }
 
-      // Seller does not exist
-      if (apiResult.notFound) {
-        return emptyResult(sellerId, url);
+      const data = await resp.json();
+
+      // Log first successful response structure for debugging field mapping
+      if (attempt === 1 && data) {
+        saveDebugHtml(
+          `${DEBUG_DIR}/api_response_${sellerId}.json`,
+          JSON.stringify(data, null, 2)
+        );
       }
 
-      // Parse the API response into our standard format
-      const seller = apiResult.data;
-      return parseSellerApiResponse(seller, sellerId, url);
+      return parseSellerApiResponse(data, sellerId, url);
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         await sleep(4000 * attempt);
