@@ -1,37 +1,30 @@
 #!/usr/bin/env node
 
 /**
- * Local B&Q (diy.com) verified seller scraper (browser-backed).
+ * B&Q (diy.com) verified seller scraper — API-based.
  *
- * Why browser-backed?
- * - diy.com appears to block simple HTTP fetch() calls with anti-bot/WAF pages.
- * - Playwright loads the page like a real browser so parseSellerPage() can work.
+ * Calls the Kingfisher marketplace seller API directly (no browser needed).
+ * Much faster and more reliable than browser-based scraping.
  *
  * Usage:
  *   node scrape.mjs
  *   node scrape.mjs --from 3900 --to 4100
  *   node scrape.mjs --from 3958 --to 3959 --delay 1500
- *   node scrape.mjs --from 3958 --to 3959 --delay 1500 --headed
  *
  * Output:
  *   results/sellers.csv
  *   results/progress.json
- *   results/debug/*.html  (on blocked/empty pages for troubleshooting)
  */
 
 import { writeFileSync, readFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
-import { chromium } from 'playwright';
-import { parseSellerPage } from './lib/parse.js';
 
 // --- Config ---
 const args = parseArgs(process.argv.slice(2));
 const FROM_ID = args.from ?? 1;
 const TO_ID = args.to ?? 10000;
 const DELAY_MS = args.delay ?? 2000;
-const HEADED = !!args.headed;
 
 const RESULTS_DIR = 'results';
-const DEBUG_DIR = `${RESULTS_DIR}/debug`;
 const CSV_PATH = `${RESULTS_DIR}/sellers.csv`;
 const PROGRESS_PATH = `${RESULTS_DIR}/progress.json`;
 const MAX_RETRIES = 2;
@@ -45,13 +38,8 @@ const CSV_COLUMNS = [
   'sourceUrl',
 ];
 
-let browser;
-let context;
-let page;
-
 async function main() {
   mkdirSync(RESULTS_DIR, { recursive: true });
-  mkdirSync(DEBUG_DIR, { recursive: true });
 
   const progress = loadProgress();
   initCsv();
@@ -61,7 +49,7 @@ async function main() {
   let found = 0;
   let errors = 0;
 
-  console.log(`\nB&Q Verified Seller Scraper (Playwright)`);
+  console.log(`\nB&Q Verified Seller Scraper (API)`);
   console.log(`Range: ${FROM_ID} – ${TO_ID} (${total} IDs)`);
   console.log(`Delay: ${DELAY_MS}ms`);
   console.log(`Output: ${CSV_PATH}`);
@@ -73,8 +61,6 @@ async function main() {
   if (alreadyDone > 0) {
     console.log(`Resuming — ${alreadyDone} IDs already processed`);
   }
-
-  await initBrowser();
 
   console.log('');
 
@@ -104,7 +90,6 @@ async function main() {
     }
   } finally {
     saveProgress(progress);
-    await closeBrowser();
   }
 
   console.log(`\n--- Done ---`);
@@ -114,68 +99,23 @@ async function main() {
   console.log(`Results saved to: ${CSV_PATH}`);
 }
 
-async function initBrowser() {
-  browser = await chromium.launch({
-    headless: !HEADED,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-    ],
-  });
-
-  context = await browser.newContext({
-    locale: 'en-GB',
-    timezoneId: 'Europe/London',
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 900 },
-    extraHTTPHeaders: {
-      'Accept-Language': 'en-GB,en;q=0.9',
-      'Upgrade-Insecure-Requests': '1',
-    },
-  });
-
-  // Pre-set TrustArc cookie consent so the SPA doesn't gate API calls
-  // behind the consent banner. Without these, the seller API never fires.
-  await context.addCookies([
-    { name: 'notice_gdpr_prefs', value: '0,1,2:', domain: '.diy.com', path: '/' },
-    { name: 'notice_preferences', value: '2:', domain: '.diy.com', path: '/' },
-    { name: 'notice_behavior', value: 'expressed,eu', domain: '.diy.com', path: '/' },
-    { name: 'cmapi_gtm_bl', value: '', domain: '.diy.com', path: '/' },
-    { name: 'cmapi_cookie_privacy', value: 'permit 1,2,3', domain: '.diy.com', path: '/' },
-  ]);
-
-  page = await context.newPage();
-
-  // Light stealth-ish tweaks (not magic, but helps)
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
-}
-
-async function closeBrowser() {
-  try { if (page) await page.close(); } catch {}
-  try { if (context) await context.close(); } catch {}
-  try { if (browser) await browser.close(); } catch {}
-}
+// Kingfisher marketplace seller API key (publicly embedded in every diy.com page)
+const SELLER_API_KEY = 'eyJvcmciOiI2MGFlMTA0ZGVjM2M1ZjAwMDFkMjYxYTkiLCJpZCI6IjE0NmFhMTQ5ZGIxYjQ4OGI4OWJlMTNkNTI0MmVhMmZmIiwiaCI6Im11cm11cjEyOCJ9';
 
 async function scrapeSeller(sellerId) {
   const url = `https://www.diy.com/verified-sellers/seller/${sellerId}`;
-  const SELLER_API_KEY = 'eyJvcmciOiI2MGFlMTA0ZGVjM2M1ZjAwMDFkMjYxYTkiLCJpZCI6IjE0NmFhMTQ5ZGIxYjQ4OGI4OWJlMTNkNTI0MmVhMmZmIiwiaCI6Im11cm11cjEyOCJ9';
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Call the Kingfisher seller API directly from Node.js.
-      // The API key is publicly embedded in every diy.com page.
-      // This bypasses both the broken SPA rendering and CORS restrictions.
-      const apiUrl = `https://api.kingfisher.com/v1/sellers/${sellerId}`;
+      // Call the Kingfisher marketplace seller API directly.
+      // URL: /v1/sellers/BQUK/{sellerId}  (BQUK = B&Q UK tenant)
+      // Auth: Authorization header (not x-api-key)
+      // Accept: */* (application/json returns 406)
+      const apiUrl = `https://api.kingfisher.com/v1/sellers/BQUK/${sellerId}`;
       const resp = await fetch(apiUrl, {
         headers: {
-          'x-api-key': SELLER_API_KEY,
-          'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Origin': 'https://www.diy.com',
-          'Referer': 'https://www.diy.com/',
+          'Authorization': SELLER_API_KEY,
+          'Accept': '*/*',
         },
       });
 
@@ -192,17 +132,8 @@ async function scrapeSeller(sellerId) {
         return { sellerId, error: errMsg };
       }
 
-      const data = await resp.json();
-
-      // Log first successful response structure for debugging field mapping
-      if (attempt === 1 && data) {
-        saveDebugHtml(
-          `${DEBUG_DIR}/api_response_${sellerId}.json`,
-          JSON.stringify(data, null, 2)
-        );
-      }
-
-      return parseSellerApiResponse(data, sellerId, url);
+      const json = await resp.json();
+      return parseSellerApiResponse(json, sellerId, url);
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         await sleep(4000 * attempt);
@@ -217,49 +148,43 @@ async function scrapeSeller(sellerId) {
 
 /**
  * Parse the Kingfisher seller API JSON response into our flat CSV format.
- * The API typically returns fields like corporateName, vatNumber, address, etc.
+ *
+ * API response shape (JSON:API):
+ *   { data: { id, type, attributes: {
+ *       corporateName, taxIdentificationNumber, shippingCountry,
+ *       corporateContactInformation: { street1, city, state, country, postCode }
+ *   }}}
  */
-function parseSellerApiResponse(data, sellerId, sourceUrl) {
-  if (!data || typeof data !== 'object') {
+function parseSellerApiResponse(json, sellerId, sourceUrl) {
+  const attrs = json?.data?.attributes;
+  if (!attrs) {
     return emptyResult(sellerId, sourceUrl);
   }
 
-  // The API response structure may vary; try common field names
-  const businessName =
-    data.corporateName || data.companyName || data.name || data.businessName || '';
+  const businessName = (attrs.corporateName || attrs.sellerName || '').trim();
+  const vatNumber = (attrs.taxIdentificationNumber || '').trim();
+  const shippedFrom = (attrs.shippingCountry || '').trim();
 
-  const vatNumber =
-    data.vatNumber || data.vatNo || data.vat || '';
-
-  // Address may be a string or structured object
+  // Use corporateContactInformation for the registered address
   let registeredAddress = '';
-  if (typeof data.address === 'string') {
-    registeredAddress = data.address;
-  } else if (data.address && typeof data.address === 'object') {
-    const a = data.address;
+  const addr = attrs.corporateContactInformation || attrs.contactInformation;
+  if (addr && typeof addr === 'object') {
     registeredAddress = [
-      a.line1 || a.street1 || a.addressLine1 || '',
-      a.line2 || a.street2 || a.addressLine2 || '',
-      a.city || a.town || '',
-      a.county || a.state || a.region || '',
-      a.postcode || a.postalCode || a.zipCode || a.zip || '',
-      a.country || a.countryCode || '',
-    ].filter(Boolean).join(', ');
-  } else if (data.registeredAddress) {
-    registeredAddress = typeof data.registeredAddress === 'string'
-      ? data.registeredAddress
-      : JSON.stringify(data.registeredAddress);
+      addr.street1 || '',
+      addr.street2 || '',
+      addr.city || '',
+      addr.state || '',
+      addr.postCode || '',
+      addr.country || '',
+    ].filter(Boolean).map(s => s.trim()).join(', ');
   }
-
-  const shippedFrom =
-    data.shippingCountry || data.shipsFrom || data.countryShippedFrom || '';
 
   return {
     sellerId,
-    businessName: (businessName || '').trim(),
-    vatNumber: (vatNumber || '').trim(),
-    registeredAddress: (registeredAddress || '').trim(),
-    shippedFrom: (shippedFrom || '').trim(),
+    businessName,
+    vatNumber,
+    registeredAddress,
+    shippedFrom,
     sourceUrl,
   };
 }
@@ -273,62 +198,6 @@ function emptyResult(sellerId, url) {
     shippedFrom: '',
     sourceUrl: url,
   };
-}
-
-function isBlockedHtml(html, status, finalUrl = '') {
-  // Strip <script> and <style> tags to avoid matching config JSON
-  // (diy.com embeds "showCaptcha", "googleCaptchaSiteKey" etc. in every page)
-  const visibleText = (html || '')
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    .toLowerCase();
-
-  // Strong signals of WAF / bot challenge (checked against visible content only)
-  const blockSignals = [
-    'access denied',
-    'request unsuccessful',
-    'service unavailable',
-    'temporarily unavailable',
-    'pardon our interruption',
-    'sorry, you have been blocked',
-    'verify you are human',
-    'cf-chl',
-    'bot detection',
-  ];
-
-  // These signals are safe to check against the full HTML
-  // (they won't appear in normal page config)
-  const fullHtmlSignals = [
-    'incapsula',
-    'distil',
-    '/_sec/',
-  ];
-
-  // status 503 often means challenge/interstitial here
-  if (status === 503) return true;
-
-  if (blockSignals.some((s) => visibleText.includes(s))) return true;
-
-  const fullText = (html || '').toLowerCase();
-  if (fullHtmlSignals.some((s) => fullText.includes(s))) return true;
-
-  // Check for actual captcha challenge elements (not config keys)
-  if (/solve.{0,20}captcha|complete.{0,20}captcha|captcha-container|captcha-box|g-recaptcha[^"]/i.test(visibleText)) {
-    return true;
-  }
-
-  // Sometimes challenge pages redirect to generic routes
-  if (finalUrl && /challenge|captcha|blocked/i.test(finalUrl)) return true;
-
-  return false;
-}
-
-function saveDebugHtml(path, html) {
-  try {
-    writeFileSync(path, html, 'utf-8');
-  } catch {
-    // ignore debug write failures
-  }
 }
 
 // --- CSV helpers ---
@@ -381,7 +250,6 @@ function parseArgs(argv) {
     if (argv[i] === '--from' && argv[i + 1]) result.from = parseInt(argv[i + 1], 10);
     if (argv[i] === '--to' && argv[i + 1]) result.to = parseInt(argv[i + 1], 10);
     if (argv[i] === '--delay' && argv[i + 1]) result.delay = parseInt(argv[i + 1], 10);
-    if (argv[i] === '--headed') result.headed = true;
   }
   return result;
 }
