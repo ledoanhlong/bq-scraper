@@ -207,8 +207,12 @@ function parseSellerApiResponse(json, sellerId, sourceUrl) {
   const vatNumber = (attrs.taxIdentificationNumber || '').trim();
   const shippedFrom = (attrs.shippingCountry || '').trim();
 
+  // Prefer corporateContactInformation, but fall back to contactInformation
+  // if the corporate fields are placeholder "TBC" values
   let registeredAddress = '';
-  const addr = attrs.corporateContactInformation || attrs.contactInformation;
+  const corpAddr = attrs.corporateContactInformation;
+  const contactAddr = attrs.contactInformation;
+  const addr = (corpAddr && !isTbcAddress(corpAddr)) ? corpAddr : contactAddr;
   if (addr && typeof addr === 'object') {
     registeredAddress = [
       addr.street1 || '',
@@ -228,6 +232,14 @@ function parseSellerApiResponse(json, sellerId, sourceUrl) {
     shippedFrom,
     sourceUrl,
   };
+}
+
+/** Returns true if all address fields are "TBC" or empty placeholders. */
+function isTbcAddress(addr) {
+  const vals = [addr.street1, addr.street2, addr.city, addr.state, addr.postCode, addr.country]
+    .map((v) => (v || '').trim().toUpperCase())
+    .filter(Boolean);
+  return vals.length === 0 || vals.every((v) => v === 'TBC');
 }
 
 function emptyResult(sellerId, url) {
